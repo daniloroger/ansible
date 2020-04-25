@@ -1,0 +1,6 @@
+[master]
+vm-lnx-01 ansible_ssh_user=root
+
+[workers]
+vm-lnx-02 ansible_ssh_user=root
+vm-lnx-03 ansible_ssh_user=root

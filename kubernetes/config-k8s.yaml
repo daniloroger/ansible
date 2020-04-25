@@ -1,0 +1,207 @@
+---
+- hosts: all
+  become: yes
+  tasks:
+  - name: Stopping firewall
+    service:
+      name: firewalld
+      enabled: no
+      state: stopped
+
+#  #If firewall is needed, minimum configuration:
+#  - name: Configure firewall rules
+#    firewalld:
+#      state: enabled
+#      permanent: yes
+#      immediate: yes
+#      port: "{{ item }}"
+#    with_items:
+#      - 6443/tcp
+#      - 10250/tcp
+
+  - name: Put SELINUX in permissive
+    shell: /sbin/setenforce 0
+    changed_when: no
+
+  - name: Put SELINUX in permissive - config
+    replace:
+      path: /etc/selinux/config
+      regexp: 'SELINUX=enforcing'
+      replace: 'SELINUX=permissive'
+      #Ref: https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/#installing-kubeadm-kubelet-and-kubectl
+
+  - name: Backup FSTAB
+    copy:
+      src: /etc/fstab
+      dest: /etc/fstab-bkp
+      follow: yes
+
+  - name: Remove SWAP
+    replace:
+      path: /etc/fstab
+      regexp: '(.*swap*)'
+      replace: '#\1'
+    changed_when: no
+
+  - name: Configure RPM Fusion
+    package:
+      name:
+        - https://download1.rpmfusion.org/free/el/rpmfusion-free-release-7.noarch.rpm
+      state: present
+
+  - name: Install TOOLS
+    package:
+      name:
+        - vim-enhanced
+        - openssh-clients
+        - telnet
+        - lsof
+        - nc
+        - rsync
+        - wget
+        - unzip
+        - bash-completion
+        - iptraf-ng
+        - iotop
+        - htop
+        - tcpdump
+        - git
+      state: present
+
+  - name: Copy SYSCTL file - IPv6 bridge-nf-call (Just in case)
+    template:
+      src: 01_bridge.conf.j2
+      dest: /etc/sysctl.d/01_bridge.conf
+      owner: root
+      group: root
+      mode: 0644
+  
+  - name: Copy SYSCTL file - IPv6 Disable
+    template:
+      src: 02_disable_ipv6.conf.j2
+      dest: /etc/sysctl.d/02_disable_ipv6.conf
+      owner: root
+      group: root
+      mode: 0644      
+
+  - name: Copy SYSCTL file - IP Forward
+    template:
+      src: 03_ip-forward.conf.j2
+      dest: /etc/sysctl.d/03_ip-forward.conf
+      owner: root
+      group: root
+      mode: 0644
+
+  - name: Copy Docker REPO
+    template:
+      src: docker-ce.repo.j2
+      dest: /etc/yum.repos.d/docker-ce.repo
+      owner: root
+      group: root
+      mode: 0644
+
+  - name: Install Docker
+    package:
+      name: "{{ item }}"
+      state: present
+    with_items:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+
+  - name: Copy K8S REPO
+    template:
+      src: kubernetes.repo.j2
+      dest: /etc/yum.repos.d/kubernetes.repo
+      owner: root
+      group: root
+      mode: 0644
+
+  - name: Adjust Docker in ETC
+    file:
+      path: /etc/docker
+      state: directory
+      recurse: yes
+      owner: root
+      group: root
+
+  - name: Adjust Docker JSON file
+    template:
+      src: docker-daemon.j2
+      dest: /etc/docker/daemon.json
+      owner: root
+      group: root
+      mode: 0644
+
+  - name: Install KUBE tools
+    package:
+      name: "{{ item }}"
+      state: present
+    with_items:
+      - kubeadm
+      - kubelet
+      - kubectl
+
+  - name: Adjust Kubelet file
+    template:
+      src: sysconfig-kubelet.j2
+      dest: /etc/sysconfig/kubelet
+      owner: root
+      group: root
+      mode: 0644
+
+  - name: Enable services
+    service:
+      name: "{{ item }}"
+      enabled: yes
+    with_items:
+      - kubelet
+      - docker
+
+  - name: Reboot servers
+    reboot:
+      reboot_timeout: 180
+      pre_reboot_delay: 60
+      msg: "Reboot system by Ansible. Use 'shutdown -c' to cancel."
+
+  - name: Configure master node
+    block:
+
+    - name: Getting Kubernetes base images
+      shell: kubeadm config images pull
+      delay: 140
+      retries: 2
+
+    - name: Creating cluster
+      shell: kubeadm init --pod-network-cidr=10.230.0.0/16 --apiserver-advertise-address $(hostname -i) >> /var/log/cluster_init_info.log 2>&1
+      #Change "pod-network-cidr" according to network project, FLANNEL etc.
+
+    - name: Capture token for worker nodes
+      shell: grep -A1 "kubeadm join" /var/log/cluster_init_info.log
+      register: CLUSTER_JOIN_TOKEN
+
+    - name: Add a dummy host to export values
+      add_host:
+        name:   "K8S_JOIN_TOKEN"
+        token:  "{{ CLUSTER_JOIN_TOKEN.stdout }}"
+
+    - name: Minimum configuration for kubectl CMD
+      shell: |
+       mkdir -p $HOME/.kube
+       sudo cp -f /etc/kubernetes/admin.conf $HOME/.kube/config
+       sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+    - name: Install CALICO Network
+      shell: kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml  >> /var/log/pod_network_setup.log 2>&1
+
+    when:
+      - "'master' in group_names"
+
+  - name: Configure work nodes
+    block:
+    - name: Joining worker nodes with kubernetes master
+      shell: "{{ hostvars['K8S_JOIN_TOKEN']['token'] }} >> /var/log/node_k8s_info.log 2>&1"
+    when:
+      - "'workers' in group_names"
+
+...
