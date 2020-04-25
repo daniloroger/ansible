@@ -1,2 +1,2 @@
-# lab01
-Repo Lab
+# Ansible LABs
+Exemplos simples de código com Ansible.
